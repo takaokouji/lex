@@ -18,7 +18,8 @@ module Lex
                   :state_error,
                   :state_lexemes,
                   :logger,
-                  :options
+                  :options,
+                  :eof_actions
 
       # @api private
       def initialize
@@ -32,6 +33,7 @@ module Lex
         @logger         = Lex::Logger.new
         @options        = Set.new
         @current_states = nil
+        @eof_actions    = []
       end
 
       # Specify lexing option
@@ -108,12 +110,13 @@ module Lex
       #   the regex pattern
       #
       # @api public
-      def rule(*args)
-        return rule_name_pattern_action(*args) if block_given? || !args.last.is_a?(Proc) || args.last.arity == 2
+      def rule(*args, &action)
+        return rule_name_pattern_action(*args, &action) if !action || action.arity == 2
+
+        complain("Specify an action") if !action
 
         state_names_pattern = []
         states = @current_states || []
-        action = nil
         args.each do |arg|
           case arg
           when Symbol
@@ -145,56 +148,43 @@ module Lex
             state_names_pattern << [states, re]
 
             states = @current_states || []
-          when Proc
-            case arg.arity
-            when 0
-              action_0 = arg
-              action = ->(lexer, token) {
-                result = lexer.instance_exec(&action_0)
-                if token.name
-                  token
-                else
-                  case result
-                  when Symbol
-                    token.name = result
-                    token
-                  when String
-                    token.name = result
-                    token.value = result
-                    token
-                  else
-                    nil
-                  end
-                end
-              }
-            when 1
-              action_1 = arg
-              action = ->(lexer, token) {
-                result = lexer.instance_exec(token, &action_1)
-                if token.name
-                  token
-                else
-                  case result
-                  when Symbol
-                    token.name = result
-                    token
-                  when String
-                    token.name = result
-                    token.value = result
-                    token
-                  else
-                    nil
-                  end
-                end
-              }
-            else
-              action = arg
-            end
           end
         end
 
         complain("Specify a pattern") if state_names_pattern.empty?
-        complain("Specify an action") if !action
+
+        case action.arity
+        when 0
+          action_0 = action
+          action_2 = ->(lexer, token) {
+            lexer.instance_exec(&action_0)
+          }
+        when 1
+          action_1 = action
+          action_2 = ->(lexer, token) {
+            lexer.instance_exec(token, &action_1)
+          }
+        else
+          complain("Specified action takes an invalid number of arguments")
+        end
+        action = ->(lexer, token) {
+          result = action_2.call(lexer, token)
+          if token.name
+            token
+          else
+            case result
+            when Symbol
+              token.name = result
+              token
+            when String
+              token.name = result
+              token.value = result
+              token
+            else
+              nil
+            end
+          end
+        }
 
         state_names_pattern.each do |state_names, pattern|
           state_names.each do |state_name|
@@ -204,6 +194,13 @@ module Lex
         end
 
         update_inclusive_states
+      end
+
+      # Specify action when the EOF is reached
+      #
+      # @api public
+      def eof(&action)
+        @eof_actions << action if action
       end
 
       # Define ignore condition for a state

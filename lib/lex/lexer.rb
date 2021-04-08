@@ -30,7 +30,8 @@ module Lex
                    :state_ignore,
                    :state_error,
                    :state_lexemes,
-                   :options
+                   :options,
+                   :eof_actions
 
     def initialize(options = {}, &block)
       rewind
@@ -156,6 +157,10 @@ module Lex
 
         logger.info "lex: #{longest_token}" if debug
         block.call(longest_token)
+      end
+
+      eof_actions.each do |action|
+        instance_exec(&action)
       end
     end
 
