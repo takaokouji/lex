@@ -19,7 +19,8 @@ module Lex
                 :logger,
                 :debug,
                 :current_state,
-                :current_line
+                :current_line,
+                :current_token
 
     def_delegators :@dsl,
                    :lex_tokens,
@@ -28,18 +29,19 @@ module Lex
                    :state_names,
                    :state_ignore,
                    :state_error,
-                   :state_lexemes
+                   :state_lexemes,
+                   :options
 
     def initialize(options = {}, &block)
       rewind
 
       @logger           = Lex::Logger.new
       @linter           = Lex::Linter.new
-      @debug            = options[:debug]
       @dsl              = self.class.dsl
+      @debug            = options[:debug] || self.options.include?(:debug)
 
       @dsl.instance_eval(&block) if block
-      @linter.lint(self)
+      @linter.lint(self) unless self.options.include?(:nolint)
     end
 
     # Tokenizes input and returns all tokens
@@ -77,9 +79,10 @@ module Lex
     def stream_tokens(input, &block)
       scanner = StringScanner.new(input)
       while !scanner.eos?
+        @unput_strings.clear unless @unput_strings.empty?
         current_char = scanner.peek(1)
-        if @dsl.state_ignore[current_state].include?(current_char)
-          scanner.pos += current_char.size
+        if @dsl.state_ignore[current_state]&.include?(current_char)
+          scanner.pos += current_char.bytesize
           @char_pos_in_line += current_char.size
           next
         end
@@ -97,24 +100,35 @@ module Lex
           longest_token = match
         end
 
+        @current_token = longest_token
+
         if longest_token
-          longest_token_value_length = longest_token.value.length
+          longest_token_value = longest_token.value.dup
+          move_by = longest_token_value.bytesize
           if longest_token.action
             new_token = longest_token.action.call(self, longest_token)
+            if @unput_strings.length > 0
+              unput_string = @unput_strings.reverse.join
+              if /#{Regexp.quote(unput_string)}$/ =~ scanner.peek(move_by)
+                move_by -= unput_string.bytesize
+              else
+                complain("'unput' supports only to the end of the original string")
+              end
+            end
             # No value returned from action move to the next token
             if new_token.nil? || !new_token.is_a?(Token)
-              chars_to_skip = longest_token_value_length
-              scanner.pos += chars_to_skip
+              scanner.pos += move_by
               unless longest_token.name == :newline
-                @char_pos_in_line += chars_to_skip
+                @char_pos_in_line += longest_token_value.length
               end
               next
             end
           end
-          move_by = longest_token_value_length
           start_char_pos_in_token = @char_pos_in_line + current_char.size
           longest_token.update_line(current_line, start_char_pos_in_token)
           advance_column(move_by)
+          num_newlines = longest_token_value.encode("utf-8", invalid: :replace, undef: :replace).count("\n")
+          advance_line(num_newlines) if num_newlines > 0
           scanner.pos += move_by
         end
 
@@ -127,7 +141,7 @@ module Lex
             token.update_line(current_line, start_char_pos_in_token)
             new_token = @dsl.state_error[current_state].call(self, token)
             advance_column(current_char.length)
-            scanner.pos += current_char.length
+            scanner.pos += current_char.bytesize
             if new_token.is_a?(Token) || !new_token.nil?
               longest_token = new_token
             else
@@ -152,11 +166,15 @@ module Lex
     #
     # @api public
     def begin(state)
+      state = :initial if state == :INITIAL
+
       unless @dsl.state_info.key?(state)
         complain("Undefined state: #{state}")
       end
       @current_state = state
     end
+
+    alias_method :begins, :begin
 
     # Enter new state and save old one on stack
     #
@@ -203,6 +221,24 @@ module Lex
       @char_pos_in_line = 0
       @current_state    = :initial
       @state_stack      = []
+      @unput_strings    = []
+      @current_token    = nil
+    end
+
+    # Puts the string back onto the input stream
+    #
+    # @param [String] str
+    #
+    # @api public
+    def unput(str)
+      @unput_strings << str
+    end
+
+    # Set current token name representation of ECHO (__ECHO__)
+    #
+    # @api public
+    def echo
+      current_token.name = :__ECHO__
     end
 
     private

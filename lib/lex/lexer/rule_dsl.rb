@@ -17,19 +17,56 @@ module Lex
                   :state_ignore,
                   :state_error,
                   :state_lexemes,
-                  :logger
+                  :logger,
+                  :options
 
       # @api private
       def initialize
-        @state_info    = { initial: :inclusive }
-        @state_ignore  = { initial: '' }  # Ignored characters for each state
-        @state_error   = {} # Error conditions for each state
-        @state_re      = Hash.new { |hash, name| hash[name] = {}} # Regexes for each state
-        @state_names   = {} # Symbol names for each state
-        @state_lexemes = Hash.new { |hash, name| hash[name] = State.new(name) }
-        @lex_tokens    = []  # List of valid tokens
-        @logger        = Lex::Logger.new
+        @state_info     = { initial: :inclusive }
+        @state_ignore   = { initial: '' }  # Ignored characters for each state
+        @state_error    = {} # Error conditions for each state
+        @state_re       = Hash.new { |hash, name| hash[name] = {}} # Regexes for each state
+        @state_names    = {} # Symbol names for each state
+        @state_lexemes  = Hash.new { |hash, name| hash[name] = State.new(name) }
+        @lex_tokens     = []  # List of valid tokens
+        @logger         = Lex::Logger.new
+        @options        = Set.new
+        @current_states = nil
       end
+
+      # Specify lexing option
+      #
+      # @param [Symbol] name
+      #   the option name
+      #
+      # @api public
+      def option(name)
+        @options << name
+      end
+
+      # Add inclusive states to lexer
+      #
+      # @param [Symbol, Array<Symbol>] names
+      #   an array of inclusive state names
+      #
+      # @api public
+      def inclusive_states(names)
+        @state_info.merge!(Array(names).to_h { |n| [n, :inclusive] })
+      end
+
+      alias_method :s, :inclusive_states
+
+      # Add exclusive states to lexer
+      #
+      # @param [Symbol, Array<Symbol>] names
+      #   an array of exclusive state names
+      #
+      # @api public
+      def exclusive_states(names)
+        @state_info.merge!(Array(names).to_h { |n| [n, :exclusive] })
+      end
+
+      alias_method :x, :exclusive_states
 
       # Add tokens to lexer
       #
@@ -45,6 +82,23 @@ module Lex
         @state_info.merge!(value)
       end
 
+      # Add states to lexer
+      #
+      # @param [Symbol, Array<Symbol>] names
+      #   an array of state names for specify lexing rule
+      #
+      # @api public
+      def rule_for(names, &block)
+        complain("Already specified '#{@current_states.join(', ')}' states") if @current_states
+
+        @current_states = Array(names)
+        begin
+          block.call
+        ensure
+          @current_states = nil
+        end
+      end
+
       # Specify lexing rule
       #
       # @param [Symbol] name
@@ -54,23 +108,102 @@ module Lex
       #   the regex pattern
       #
       # @api public
-      def rule(name, pattern, &action)
-        state_names, token_name = *extract_state_token(name)
-        if token_name =~ /^[[:upper:]]*$/ && !@lex_tokens.include?(token_name)
-          complain("Rule '#{name}' defined for" \
-                   " an unspecified token #{token_name}")
-        end
-        state_names.each do |state_name|
-          state = @state_lexemes[state_name]
-          state << Lexeme.new(token_name, pattern, &action)
-        end
-        update_inclusive_states
-        state_names.each do |state_name|
-          if @state_re[state_name].key?(token_name)
-            complain("Rule '#{name}' redefined.")
+      def rule(*args)
+        return rule_name_pattern_action(*args) if block_given? || !args.last.is_a?(Proc) || args.last.arity == 2
+
+        state_names_pattern = []
+        states = @current_states || []
+        action = nil
+        args.each do |arg|
+          case arg
+          when Symbol
+            complain("Already specified '#{@current_states.join(', ')}' states") if @current_states
+
+            name = arg
+            if name == :*
+              states = @state_info.keys
+            else
+              states << name
+            end
+          when Regexp, String
+            if arg.is_a?(Regexp)
+              re = arg
+            else
+              re = Regexp.new(Regexp.quote(arg))
+            end
+            re = /#{re.source}/i if @options.include?(:caseless)
+
+            if states.empty?
+              states = [:initial]
+            else
+              states.uniq!
+              if states.include?(:INITIAL)
+                states.delete(:INITIAL)
+                states << :initial
+              end
+            end
+            state_names_pattern << [states, re]
+
+            states = @current_states || []
+          when Proc
+            case arg.arity
+            when 0
+              action_0 = arg
+              action = ->(lexer, token) {
+                result = lexer.instance_exec(&action_0)
+                if token.name
+                  token
+                else
+                  case result
+                  when Symbol
+                    token.name = result
+                    token
+                  when String
+                    token.name = result
+                    token.value = result
+                    token
+                  else
+                    nil
+                  end
+                end
+              }
+            when 1
+              action_1 = arg
+              action = ->(lexer, token) {
+                result = lexer.instance_exec(token, &action_1)
+                if token.name
+                  token
+                else
+                  case result
+                  when Symbol
+                    token.name = result
+                    token
+                  when String
+                    token.name = result
+                    token.value = result
+                    token
+                  else
+                    nil
+                  end
+                end
+              }
+            else
+              action = arg
+            end
           end
-          @state_re[state_name][token_name] = pattern
         end
+
+        complain("Specify a pattern") if state_names_pattern.empty?
+        complain("Specify an action") if !action
+
+        state_names_pattern.each do |state_names, pattern|
+          state_names.each do |state_name|
+            state = @state_lexemes[state_name]
+            state << Lexeme.new(nil, pattern, &action)
+          end
+        end
+
+        update_inclusive_states
       end
 
       # Define ignore condition for a state
@@ -122,6 +255,26 @@ module Lex
       end
 
       private
+
+      # @api private
+      def rule_name_pattern_action(name, pattern, &action)
+        state_names, token_name = *extract_state_token(name)
+        if token_name =~ /^[[:upper:]]*$/ && !@lex_tokens.include?(token_name)
+          complain("Rule '#{name}' defined for" \
+            " an unspecified token #{token_name}")
+        end
+        state_names.each do |state_name|
+          state = @state_lexemes[state_name]
+          state << Lexeme.new(token_name, pattern, &action)
+        end
+        update_inclusive_states
+        state_names.each do |state_name|
+          if @state_re[state_name].key?(token_name)
+            complain("Rule '#{name}' redefined.")
+          end
+          @state_re[state_name][token_name] = pattern
+        end
+      end
 
       # For inclusive states copy over initial state rules
       #
